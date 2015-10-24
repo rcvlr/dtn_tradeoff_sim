@@ -1,21 +1,15 @@
-/* Simulator.
+/* Simulator for DTN under Random Waypoint mobility.
  * 
  * Nodes moves on a torus.
- * 
- * For details see routing.pdf.
- * The program writes a log file that contains the histogram of the 
- * direction of the packet: each line corresponds to one bin of the 
- * histogram, in this way we avoid to write a huge file.
- * 
- * See http://www.gnu.org/software/gsl/manual/html_node/Histograms.html
- * for details.
- * 
+
  * Build and run with: 
  * 		gcc -Wall -lgsl -lgslcblas -lm -o sim sim.c && ./sim
  * 
  * How to read the histogram file in Matlab:
  * fp = fopen('log.txt');
  * a = textscan(fp,'%f %f %f'); % a is a cell 
+ * 
+ * author: riccardo.cavallari@unibo.it
  */
  
 #include <stdio.h>
@@ -33,6 +27,7 @@
 #define HIST_BINS			101 // odd number so 0 is included
 #define ALLOC_MIN_SIZE  	10
 #define NUM_ALLOC_STAGES  	100
+#define NUM_ALLOC_STAGES1  	100
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 //#define DEBUG
 
