@@ -1,15 +1,32 @@
 /* Simulator for DTN under Random Waypoint mobility.
  * 
  * Nodes moves on a torus.
-
- * Build and run with: 
- * 		gcc -Wall -lgsl -lgslcblas -lm -o sim sim.c && ./sim
+ * To change the FR, modify the function is_in_fr
+ * To change the RR, modify the function is_better
+ * The simulator will run and it will produce one log files:
+ *  - log_stages.txt: log where each line represents a stages and its
+ *    quantities needed to calculate the final metrics.
+ *  - metrics.txt: different metrics as in the paper.
+ *  - psi.txt: histogram of the limiting distribution function Psi.
  * 
- * How to read the histogram file in Matlab:
- * fp = fopen('log.txt');
- * a = textscan(fp,'%f %f %f'); % a is a cell 
+ * If, for any reason you want to quit the simulation, hit Ctrl+c. The
+ * log will be generated with the intermediate results. This is useful
+ * to quit a simulation that takes too long due to the "infinite routing"
+ * problem.
+ *
+ * Build with: 
+ * 		gcc sim.c -Wall -lgsl -lgslcblas -lm -Ofast -o sim
  * 
  * author: riccardo.cavallari@unibo.it
+ *
+ * For the discretization of thetas:
+ * use this formula to calculate the center of the bins
+ * thetas=-pi+(pi/N)*(2*(1:1:N)-1);
+ *
+ * Changelog
+ * 
+ * 11.03.2018: added a parameter to use a constant seed for rand.
+ *
  */
  
 #include <stdio.h>
@@ -22,61 +39,64 @@
 #include <gsl/gsl_histogram.h>
 
 // Macro
-#define TORUS_X			  	200
-#define TORUS_Y			    200
-#define HIST_BINS			101 // odd number so 0 is included
+#define TORUS_X			    100
+#define TORUS_Y			    TORUS_X
 #define ALLOC_MIN_SIZE  	10
 #define NUM_ALLOC_STAGES  	100
-#define NUM_ALLOC_STAGES1  	100
+#define HIST_BINS		    128
+#define DIR_TAU             0.1     // to avoid infinite routing loop
 #define min(a, b) (((a) < (b)) ? (a) : (b))
-//#define DEBUG
 
 // Typedefs
 struct Node {
-	int nodeId;	// id of the node
+	int nodeId;	    // id of the node
 	double x;		// current x-position
 	double y;		// current y-position
 	double t;		// time to travel before next turn
 	double d;		// direction of travel
-	double dx;		// x increment during a leg
-	double dy;		// y increment during a leg
+	double dx;	    // x increment during a leg
+	double dy;      // y increment during a leg
 };
 
 struct Packet {
 	double d;		// current direction of travel
 	double x;		// current x-position
 	double y;		// current y-position
-	int carrierId; 		// id of the current carrier node
-	size_t numBanned;	// size of the banned list
-	int * banned; 		// pointer to an array of banned nodes
+	int carrierId; 	// id of the current carrier node
 };
 
 typedef struct {
-	double dir;		 // direction
-	double tStart;	 // start time
-	double tEnd;	 // end time
-	double txDist;	 // distance covered by tx (can be zero)
-	double txCost;   // tx cost (can be zero)
+	double dir;		    // direction
+	double tStart;	    // start time
+	double tEnd;	    // end time
+	double txDist;	    // distance covered by tx (can be zero)
+	double txCost;      // tx cost (can be zero)
 	unsigned int numHops;	// number of hops
 }stage_t;
 
 // Global varialbles
-unsigned int numOfNodes;
-double r;
-double r2;
-double v0;
-double r0;
-double simDur;
-double dT;
-double dS;
-int rule;
-double tau;
-FILE * fp;
-FILE * fp3;
-gsl_histogram * hist = NULL;
+unsigned long int numOfNodes;
+double lambda;  // density
+double a;       // boundary function parameter
+double b;       // boundary function parameter
+double v0;      // nodes' speed
+double r0;      // turning rate
+double tw;      // parameter of f_D(x)
+double simDur;  // duration of the simulation
+double dT;      // duration of the simulation step
+double dS;      // distance covered in dT
+int    log_stages = 0; // 1 for logging stages, 0 for not
+char   boundary;    // boundary function
+char   potential;   // potential function
+int stageOrTime;    // if 1 simDur is in number of stages; if 0, simDur is in time
+int seedRand; // if -1 seed it time(NULL); if > -1, seed is seedRand 
+FILE * f_stages;
+FILE * f_metrics;
+FILE * f_psi;
 stage_t *stages = NULL;
 unsigned int numAllocStages;	// sizeof(unsigned int) = 4
-unsigned int numUsedStages;	
+unsigned int numUsedStages;
+gsl_histogram * hist = NULL;
 	
 
 /*
@@ -85,9 +105,9 @@ unsigned int numUsedStages;
  */
 double next_time(double rate)
 {	
-	double r = 0;
+    double r = 0;
 	while (r == 0) {	
-		r = (double)rand()/RAND_MAX;
+		r = (double)rand()/RAND_MAX;    // r is unif distr. in [0,1)
 	}
 	return -log(r)/rate;
 }
@@ -108,7 +128,7 @@ double dist_square(struct Node * n1, struct Node * n2)
  */
 void move_nodes(struct Node * nodeList)
 {
-  int i;
+  unsigned long int i;
   for(i=0; i<numOfNodes; i++) {
    	// update x,y coordinates
     nodeList[i].x += nodeList[i].dx;
@@ -122,78 +142,87 @@ void move_nodes(struct Node * nodeList)
   }
 }
 
-/* 
- * Return 1 if array arr contains element val,
- * return 0 otherwise.
- */
-int is_in_array(int val, int *arr, size_t len)
-{
-	if(arr == NULL) return 0;
-	
-	int i;
-	for(i=0; i<len; i++) {
-		if(arr[i] == val) return 1;
-	}
-	return 0;
-}
-
-/* 
- *  Create a list of nodes banned by the routing rule.
- *  A node is banned if it is in the forw. reg. of the carrier.
- * 	In this way we avoid multihop.
- */
-void create_ban_list(struct Packet * pkt, struct Node * nodeList)
-{
-	// release the previous array and allocate a new one
-	free(pkt->banned);
-	pkt->numBanned = 0;
-	pkt->banned = malloc(ALLOC_MIN_SIZE * sizeof(int));
-	
-	int i;
-	for(i=0; i<numOfNodes; i++)	{
-		// To be banned a node has to:
-		// 1) not be the current carrier
-		// 2) being in the tx range of the current carrier
-		
-		if( nodeList[i].nodeId != pkt->carrierId &&
-			dist_square(&nodeList[i], &nodeList[pkt->carrierId]) < r2) {
-			// add node to the banned list
-			pkt->numBanned += 1;
-			pkt->banned[pkt->numBanned - 1] = nodeList[i].nodeId;
-			
-			if(pkt->numBanned % ALLOC_MIN_SIZE == 0) {
-				pkt->banned = realloc(pkt->banned, (pkt->numBanned + ALLOC_MIN_SIZE)*sizeof(int));
-			}
-		}
-	}
-}
 
 /*
  * Cleanup function to be called before exit
  */
 void cleanup(void) {
-	
-	// write and delete the histogram
-	gsl_histogram_fprintf(fp, hist, "%g", "%g");
-	gsl_histogram_free(hist);
-  
-	// close the files
-	fclose(fp);
-	
-	// print the stages information on a file
-	printf("used = %u\talloc = %u\n", numUsedStages, numAllocStages);
-	fprintf(fp3,"num\tdur\tdir\ttxDist\ttxCost\tnumHops\n");
+    double sum_Xi = 0;  // numerator of (1)
+    double cp = 0;      // normalized packet cost
+    double delta_i = 0; // stage duration
+    double V_p = 0, C_p = 0, E_Xw = 0, E_Xb = 0, E_C = 0, E_D = 0;
+    double Xw = 0, Xb = 0, Delta = 0;
+    // allocate and initialize a histogram
+	hist = gsl_histogram_alloc(HIST_BINS);
+	gsl_histogram_set_ranges_uniform(hist, -M_PI, M_PI);
+    // print the stages information into a file
+    if (log_stages)
+    {
+        f_stages = fopen("log_stages.txt","w+");
+        fprintf(f_stages,"lambda\tV0\tR0\ttw\tSimDur\tArea\tPotential\tBoundary\ta\tb\n%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.3f\t%c\t%c\t%.2f\t%.2f\t%u\n", 
+                lambda, v0, r0, tw, simDur, (double)(TORUS_X*TORUS_Y), potential, boundary, a, b, stageOrTime);
+        fprintf(f_stages,"i\tDelta_i (dur)\tTheta_i (dir)\tX_i (txDist)\tC_i (txCost)\tN_i (numHops)\n");
+    }
+    
 	int i;
 	for(i=0; i<numUsedStages; i++) {
-		fprintf(fp3,"%u\t%f\t%f\t%f\t%f\t%u\n",
+        delta_i = stages[i].tEnd-stages[i].tStart;
+        
+        if (log_stages)
+        {
+            fprintf(f_stages,"%u\t%f\t%f\t%f\t%f\t%u\n",
 					i,
-					stages[i].tEnd-stages[i].tStart,
+					delta_i,
 					stages[i].dir,
 					stages[i].txDist,
 					stages[i].txCost,
-					stages[i].numHops);
+					stages[i].numHops);   
+        }
+        
+        // calculate the performance metrics according to eqns. (1) and (2)
+        sum_Xi += (v0 * delta_i * cos(stages[i].dir) + stages[i].txDist);
+        cp += stages[i].txCost; // don't forget to divide by sum_Xi
+        
+        // intermediate metrics
+        Xw += stages[i].txDist;
+        Xb += v0 * delta_i * cos(stages[i].dir);
+        Delta += delta_i;
+        
+        // update the histogram of Psi
+		gsl_histogram_increment(hist, stages[i].dir);
 	}
-	fclose(fp3);
+                
+    if (log_stages)
+    {
+        fclose(f_stages);
+    }
+
+    // print the histogram
+    f_psi = fopen("psi.txt","w+");
+    //gsl_histogram_fprintf(f_psi, hist, "%g", "%g"); // segfault here!
+	gsl_histogram_free(hist);
+    fclose(f_psi);
+    
+    // metrics
+    V_p = sum_Xi/Delta;
+    C_p = cp/sum_Xi;
+    
+    // intermediate metrics
+    E_Xw = Xw/numUsedStages;
+    E_Xb = Xb/numUsedStages;
+    E_C = cp/numUsedStages;
+    E_D = Delta/numUsedStages;
+    
+    f_metrics = fopen("metrics.txt","w+");
+    fprintf(f_metrics,"V_p Cp E_Xw E_Xb E_C E_D \n%f %f %f %f %f %f", 
+        V_p, C_p, E_Xw, E_Xb, E_C, E_D);
+    fclose(f_metrics);
+    
+    printf("\n-----------------------------------------------------------\n");
+    printf("V_p Cp E_Xw E_Xb E_C E_D \n%f %f %f %f %f %f\n", 
+        V_p, C_p, E_Xw, E_Xb, E_C, E_D);
+    printf("-----------------------------------------------------------");
+    printf("\nsum Delta = %f, numUsedStages = %u\n", Delta, numUsedStages);
 	
 	// releases the memory taken by the stages
 	free(stages);
@@ -204,9 +233,14 @@ void cleanup(void) {
  */
 void ctrlC_handler(int signo) {
 	// ignore the same signal while we are in its handler
-	signal(signo, SIG_IGN);		
-	printf("\nAddio...\n");
+	signal(signo, SIG_IGN);
+    
+    //discard the last stages since it's incomplete
+    numUsedStages--;
 	cleanup();
+    
+    
+	printf("\nAddio...\n");
 	exit(0);
 }
 
@@ -275,41 +309,88 @@ stage_t *get_new_stage(stage_t *st, unsigned int *numAlloc, unsigned int *numUse
 	return p;
 }
 
-/* 
- * Implementation of the routing rules.
- * Return 1 if the encountered node is eligible, 0 otherwise
- */
-int routingRule(int rule, int id, int bestId, int carrId, struct Node * nList){
-	
-	int ret = 0;
-	
-	// Routing 1
-	if (rule == 1 && 
-		fabs(nList[id].d) < fabs(nList[bestId].d))
-		ret = 1;
-	
-	// Routing 2
-	else if (rule == 2 && 
-			 fabs(get_inc_angle(&nList[id], &nList[carrId])) <= M_PI_2 &&
-			 fabs(nList[id].d) < fabs(nList[bestId].d))
-		ret = 1;
 
-	// Routing 3
-	else if (rule == 3 && 
-			 fabs(get_inc_angle(&nList[id], &nList[carrId])) <= M_PI_2 &&
-			 dist_square(&nList[id], &nList[carrId]) > dist_square(&nList[bestId], &nList[carrId]))
-		ret = 1;
-	
-	// Routing 4
-	else if (rule >= 4 &&
-			fabs(nList[id].d) <= tau &&
-			fabs(nList[id].d) < fabs(nList[bestId].d))
-		ret = 1;
-	
-	else
-		ret = 0;
-	
-	return ret;
+/*
+ * Return 1 if the node pointed by n is in the FR of the node pointed by c.
+ * Return 0, otherwise.
+ */
+int is_in_fr(struct Node *n, struct Node *c)
+{
+    /* 
+     * If the FR is:
+     *  - a disc of radius a: b(phi) = a, forall phi
+     *  - a cardioid of radius 0.5: b(phi) = 1 + 0.5*cos(phi)
+     *  - ellipse
+     */ 
+     
+    double b_phi = 0;
+    double phi = 0;
+    
+    if (boundary == 'd') {
+        // disk
+        b_phi = a;
+    }
+    else if (boundary == 'e') {
+        // ellipse
+        phi = get_inc_angle(n, c);
+        b_phi = a*(1-b*b)/(1-b*cos(phi));
+    }
+    else if (boundary == 'c') {
+        // cardioid
+        phi = get_inc_angle(n, c);
+        b_phi = a + b*cos(phi);
+    }
+    
+    if (sqrt(dist_square(n, c)) <= b_phi)
+        return 1;
+    
+    return 0;
+}
+
+/*
+ * Return 1 if the node pointed by n1 is has a higher 
+ * potential than the node pointed by n2.
+ * 
+ * Return 0, otherwise.
+ */
+int is_better(struct Node *n1, struct Node *n2)
+{
+    double u_n1 = 0;
+    double u_n2 = 0;
+    
+    if (potential == 'a') {
+        // Potential U(theta, r) = -|theta|
+        u_n1 = -fabs(n1->d);
+        u_n2 = -fabs(n2->d);   
+    }
+    // TODO else if ...
+    
+    return (u_n1 > u_n2);
+}
+
+/*
+ * Return a new directin in [-pi, pi] distributed according to f_D(x)
+ * tw is Theta_w (See paper)
+ */
+double get_new_direction(double tw)
+{
+    double d = tw/2;
+    double x, X;
+    if (tw >= 1.57 && tw < 1.58)    // pi/2
+    {
+        return ((double)rand()/RAND_MAX) * 2 * M_PI - M_PI;        
+    }
+    else
+    {
+        X = ((double)rand()/RAND_MAX) * 2 * M_PI - M_PI;
+        x = fabs(X);
+        while ((x>d && x<(M_PI_2-d))||(x>(M_PI_2+d) && x<(M_PI-d)))
+        {
+            X = ((double)rand()/RAND_MAX) * 2 * M_PI - M_PI;
+            x = fabs(X);
+        }
+        return X;
+    }
 }
 
 /*
@@ -318,71 +399,71 @@ int routingRule(int rule, int id, int bestId, int carrId, struct Node * nList){
 int main (int argc, char *argv[])
 {
 	// read command line arguments
-	if (argc < 8) {
-            printf("Usage: %s numOfNodes r v0 r0 simDur dT RULE_NUM\n",argv[0]);
-            return 1;
+	if (argc < 13) {
+        printf("Usage: %s lambda v0 r0 tw simDur dT potential_func boudary_func a b stepOrTime seedRand\n", argv[0]);
+        return 1;
     }
-    numOfNodes = atoi(argv[1]);
-    r 		   = atof(argv[2]);
-    v0         = atof(argv[3]);
-    r0         = atof(argv[4]);
+    lambda     = atof(argv[1]);
+    v0         = atof(argv[2]);
+    r0         = atof(argv[3]);
+    tw         = atof(argv[4]);
     simDur     = atof(argv[5]);
     dT         = atof(argv[6]);
-    rule 	   = atoi(argv[7]);
-    dS 		   = v0 * dT;
-    if(rule >= 4) {
-		if(argc == 9)
-			tau = atof(argv[8]);
-		else {	
-			printf("You forgot tau\n");
-			exit(1);
-		}
-	}
-	r2 = r*r;
+    potential  = *argv[7];
+    boundary   = *argv[8];
+    a          = atof(argv[9]);
+    b          = atof(argv[10]);
+    stageOrTime = atoi(argv[11]);    // 0 for time, 1 for stages
+    log_stages = atoi(argv[12]);     // 1 for logging stages, 0 for not.
+    seedRand   = atoi(argv[13]);     // -1 for using time(NULL)
+   
+    numOfNodes = (unsigned long int)(lambda * TORUS_X * TORUS_Y);
+    dS = v0 * dT;
 	
 	// Local variables
-	int progk = 1;
-	struct Node nodes[numOfNodes];
-	struct Packet pkt;
+	int progk = 1;                  // used to print the simulation progress
+    struct Node *nodes;
+    nodes = (struct Node *) malloc(numOfNodes * sizeof(struct Node));
+	struct Packet pkt;              // the tagged packet
 	
 	signal(SIGINT, ctrlC_handler);	// signal handler
-	srand(time(NULL));				// init rand with a seed
-	//~ srand(1);
-
-	// allocate and initialize a histogram
-	hist = gsl_histogram_alloc(HIST_BINS);
-	gsl_histogram_set_ranges_uniform(hist, -M_PI, M_PI);
+	
+    // init random with a seed
+    if (seedRand < 0) {
+        srand(time(NULL));
+    }
+    else {
+        srand((unsigned int)seedRand);
+    }
 		
-	// stages
+	// Allocate stages. We allocate NUM_ALLOC_STAGES at a time to optimize the time spent
+    // for memory allocation.
 	stages = (stage_t*)malloc(NUM_ALLOC_STAGES * sizeof(stage_t));
-	numAllocStages = NUM_ALLOC_STAGES;	// sizeof(unsigned int) = 4
+	if (stages == NULL){
+        printf("Cannot allocate memory!");
+        exit(1);
+    }
+        
+    numAllocStages = NUM_ALLOC_STAGES;
 	numUsedStages = 0;
     
     // create a directory for the results
     char dirName[70];
-    sprintf(dirName, "./NODES-%u_R-%.2f_V0-%.2f_R0-%.2f_SIMDUR-%.2f_RULE-%u", numOfNodes, r, v0, r0, simDur, rule);
+    sprintf(dirName, "./lambda-%.3f_v0-%.2f_r0-%.2f_tw-%.2f_simDur-%.2f_pot-%c_bound-%c_a-%.2f_b-%.2f_stageOrTime-%u", 
+            lambda, v0, r0, tw, simDur, potential, boundary, a, b, stageOrTime);
     mkdir(dirName, 0777);
     chdir(dirName);
-    
-    fp  = fopen("log.txt","w+");
-	fp3 = fopen("log_stages.txt","w+");
+         
+    // print sim info
+    printf("lambda %.3f, v0 %.2f, r0 %.2f, tw %.2f, simDur %.2f,\npot %c, bound %c, a %.2f, b %.2f, stageOrTime %u\n\n", 
+            lambda, v0, r0, tw, simDur, potential, boundary, a, b, stageOrTime);
 	
 	//------------------------------------------------------------------
 	//		Serious stuff starts here
 	//------------------------------------------------------------------
 	
-	// init the direction array: nodes' directions are discretized
-	unsigned int numDir = 1000;	// don't change this
-	double drctn[numDir+1];
-	double dstep = 2*M_PI/numDir;
-	int dirSize = sizeof(drctn)/sizeof(drctn[0]);
-	int i;
-	for (i=0; i<=numDir; i++){
-		drctn[i] = -M_PI + i*dstep;
-	}
-	
 	// Init nodes' position
-	//~ int i;
+	unsigned long int i;
 	for(i=0; i<numOfNodes; i++)	{
 		// generate nodes uniformly distributed on a torus 
 		// x is random in [0.0, TORUS_W], inclusive
@@ -390,91 +471,86 @@ int main (int argc, char *argv[])
 		nodes[i].nodeId = i;
 		nodes[i].x 	= ((double)rand()/RAND_MAX) * TORUS_X;			// initial x
 		nodes[i].y 	= ((double)rand()/RAND_MAX) * TORUS_Y;			// initial y
-		nodes[i].t 	= next_time(r0);									// duration of the first leg
-		// nodes[i].d 	= ((double)rand()/RAND_MAX) * 2 * M_PI - M_PI;	// initial direction
-		nodes[i].d 	= drctn[rand() % dirSize];	// initial direction
+		nodes[i].t 	= next_time(r0);							    // duration of the first leg
+		nodes[i].d 	= get_new_direction(tw);	            // initial random direction in [-pi, pi]
 		nodes[i].dx = dS * cos(nodes[i].d);					// x increment for the first leg
 		nodes[i].dy = dS * sin(nodes[i].d);					// y increment for the first leg
 	}
 	
 	// init packet
-	pkt.carrierId 	= 0;
-	pkt.d 			= nodes[0].d;
-	pkt.numBanned 	= 0;
-	pkt.banned 		= malloc(pkt.numBanned*sizeof(pkt.carrierId));
-	
-	// discard nodes initially located inside the forwarding region
-	//create_ban_list(&pkt, nodes);
+	pkt.carrierId = 0;
+	pkt.d 		  = nodes[0].d;
 	
 	//------------------------------------------------------------------
 	//						Simulation starts here
 	//------------------------------------------------------------------
 	double simTime = 0;
 	double oldPktDir;
+    
+    // get a new stage and init its elements
 	stage_t *currStage  = get_new_stage(stages, &numAllocStages, &numUsedStages);
 	currStage->dir 		= pkt.d;
 	currStage->tStart 	= simTime;
 	currStage->numHops	= 0;
 	currStage->txDist	= 0;
-	currStage->txCost	= 0;
+	currStage->txCost   = 0;
 	
-	while (simTime<simDur) {
+    // simulation loop
+	while (1) {
 		simTime+=dT;
 		oldPktDir = pkt.d;
 		
-		// move the nodes
-	    for (i=0; i<numOfNodes; i++) {	
+		// search for nodes that will have to change direction within the next dT
+	    for (i=0; i<numOfNodes; i++) {
 			nodes[i].t -= dT;
-			if (nodes[i].t < 0) {
+			if (nodes[i].t < 0) {   // it's time to change direction...
 				// get a new waypoint
-		        // nodes[i].d 	= ((double)rand()/RAND_MAX) * 2 * M_PI - M_PI;
-		        nodes[i].d 	= drctn[rand() % dirSize];
-		        nodes[i].t 	= next_time(r0);
-		        nodes[i].dx = dS * cosf(nodes[i].d);
-		        nodes[i].dy = dS * sinf(nodes[i].d);
+		        nodes[i].d 	= get_new_direction(tw);
+		        nodes[i].t 	= next_time(r0);            // get an exp distributed r.v. sample
+		        nodes[i].dx = dS * cos(nodes[i].d);
+		        nodes[i].dy = dS * sin(nodes[i].d);
 		        nodes[i].t -= dT;
 			}
 		}
-		move_nodes((struct Node *)nodes); // move the nodes
+		move_nodes((struct Node *)nodes); // move the nodes within the torus
 		
-	    // the packet has moved: update its direction
+	    // the packet has moved: update its direction (may not have changes)
 		pkt.d = nodes[pkt.carrierId].d;
 		
 		double dstnc2 = 0;
 	    
+        // Here we do the routing. We get out of the while(1) when no more eligible nodes
+        // are found. It can take forever.
 	    while(1) {
-			// if the packet is in the best direction there is no way
-			// to transmit it to anybody else.
-			if (pkt.d == drctn[numDir/2])
-				break;
+			// to avoid an infinite loop (i.e., an eligible node is always found, this 
+            // happens at large lambda or large forwarding region), use stageOrTime = 1
 			
-			// Find the best node range of the carrier node
+			// Find the best eligible in range of the carrier node
 			int bestId = pkt.carrierId;
 			for (i=0; i<numOfNodes; i++){
-				// skip nodes that are for sure not in range and the carrier
-				double absX = fabs(nodes[pkt.carrierId].x - nodes[i].x);
-				double absY = fabs(nodes[pkt.carrierId].y - nodes[i].y);
-				if (min(absX, TORUS_X-absX) > r || 
-					min(absY, TORUS_Y-absY) > r ||
-					pkt.carrierId == nodes[i].nodeId)
-					continue;
+                
+                // ------------ Optimization trick -------------------------------------//
+                
+                // The following block of code can be uncommented _ONLY_ if we are using a 
+                // circular disc as forwarding region. It can be adapted to other shape of
+                // FR.
+                
+                // skip nodes that are for sure not in range and the carrier
+				// double absX = fabs(nodes[pkt.carrierId].x - nodes[i].x);
+				// double absY = fabs(nodes[pkt.carrierId].y - nodes[i].y);
+				// if (min(absX, TORUS_X-absX) > r || 
+					// min(absY, TORUS_Y-absY) > r ||
+					// pkt.carrierId == nodes[i].nodeId)
+					// continue;
+                    
+                // ------------- End of optimization trick -----------------------------//
 
-				dstnc2 = dist_square(&nodes[pkt.carrierId], &nodes[i]);
-				if (dstnc2 <= r2 && routingRule(rule, i, bestId, pkt.carrierId, nodes)) {
-					#ifdef DEBUG
-						printf("t = %f, better node %d\n", simTime, nodes[i].nodeId);			
-					#endif //DEBUG
-					bestId = nodes[i].nodeId;
-				}
-				
-				#ifdef DEBUG
-					if (dstnc2 <= r2)
-						printf("t = %f, node %d in range, xn = %f, xc = %f, yn = %f, yc = %f, incAng = %f, dist = %f, dir = %f, mydir = %f\n",
-								simTime, nodes[i].nodeId, nodes[i].x, nodes[pkt.carrierId].x,
-								nodes[i].y, nodes[pkt.carrierId].y,
-								get_inc_angle(&nodes[i],&nodes[pkt.carrierId]),
-								sqrt(dstnc2), nodes[i].d, nodes[pkt.carrierId].d);
-				#endif //DEBUG
+                // Is the node inside the FR of the carrier, AND its potential
+                // is larger than the potential of the best node found so far (bestId)?
+                if (is_in_fr(&nodes[i], &nodes[pkt.carrierId]) && is_better(&nodes[i], &nodes[bestId])) {
+                    // we found a better eligible node
+                    bestId = nodes[i].nodeId;
+                }
 			}
 			
 			// at this point the best node in range is found, if any.
@@ -488,15 +564,8 @@ int main (int argc, char *argv[])
 				// update packet
 				pkt.carrierId = bestId;
 				pkt.d = nodes[bestId].d;
-				
-				#ifdef DEBUG
-					printf("t = %f, best node: %d\n-------------------------\n",
-							simTime, nodes[bestId].nodeId);
-					printf("Press Any Key to Continue\n");  
-					getchar();  
-				#endif //DEBUG
 			}
-			else
+			else        // no eligible node is found...
 				break;
 		}
 		
@@ -515,22 +584,34 @@ int main (int argc, char *argv[])
 				currStage->numHops	= 0;
 			}
 		}
-			
-	    // update the histogram: it must be done once per timestep
-		gsl_histogram_increment(hist, pkt.d);
-			
+				
 		// print simulation progress
-		double p = simTime/simDur * 100.0;
+		double p = (stageOrTime ? (numUsedStages/simDur * 100.0) : (simTime/simDur * 100.0));
 		if(p >= 0.1*progk) {
 			printf("\r%.1f%%",p);
 			fflush(stdout);
 			progk += 1;
 		}
+        
+        // check if the simulation is over
+        if (stageOrTime)
+        {
+            if (numUsedStages >= simDur)
+                break;
+        }
+        else
+        {
+            if (simTime >= simDur)
+                break;
+        }
+        
 	}	// End of simulation
 	
 	// fix the last stage
 	currStage -> tEnd = simTime;
 	
+    free(nodes);
 	cleanup();
+    
 	return 0;
 }
